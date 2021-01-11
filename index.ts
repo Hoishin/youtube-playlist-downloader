@@ -9,6 +9,7 @@ import sanitizeFilename from "sanitize-filename";
 import hasha from "hasha";
 import * as cache from "./cache";
 import {MultiBar, Presets} from "cli-progress";
+import pRetry from "p-retry";
 
 // Import and validate .env configuration
 dotenv.config();
@@ -34,64 +35,77 @@ const auth = new google.auth.GoogleAuth({
 
 const progressBar = new MultiBar(
 	{
-		clearOnComplete: false,
-		hideCursor: true,
-		format: "{bar} | {id} | {percentage}% | {status}",
+		clearOnComplete: true,
+		format: "{bar} | {id} | {eta_formatted} | {status} ({queueStatus})",
+		autopadding: true,
+		etaBuffer: 500,
 	},
 	Presets.shades_classic,
 );
 
 const downloadVideo = async (id: string, etag: string, destDir: string) => {
-	const bar = progressBar.create(100, 0, {id, status: "pending"});
-	const info = await ytdl.getInfo(id);
-	const filePath = path.resolve(
-		destDir,
-		`${sanitizeFilename(info.videoDetails.title)}.webm`,
-	);
-	const cacheInfo = await cache.find(id, etag);
-	if (cacheInfo) {
-		bar.update(0, {status: "using cache"});
-		const cacheHash = cacheInfo.integrity;
-		const existingFileHash = await hasha.fromFile(filePath, {
-			encoding: "base64",
-			algorithm: cache.algorithm,
-		});
-		if (cacheHash === `${cache.algorithm}-${existingFileHash}`) {
-			bar.update(100, {status: "hash matched"});
-		} else {
-			bar.update(0, {status: "copying cache"});
-			const totalSize = cacheInfo.size;
-			let downloadedSize = 0;
-			const cacheStream = cache.getStream(id);
-			const writeStream = fs.createWriteStream(filePath);
-			cacheStream.pipe(writeStream);
-			cacheStream.on("data", (data) => {
-				downloadedSize += data.size;
-				bar.update(downloadedSize / totalSize);
+	const bar = progressBar.create(1, 0, {
+		id,
+		status: "pending",
+		queueStatus: queue.size,
+	});
+	queue.addListener("active", () => {
+		bar.update({queueStatus: queue.size});
+	});
+	await pRetry(
+		async () => {
+			const info = await ytdl.getInfo(id);
+			const format = ytdl.chooseFormat(info.formats, {
+				quality: "highest",
+				filter: (format) => format.container === "webm",
 			});
-			await pEvent(cacheStream, "end");
-			bar.update(100, {status: "cache copy done"});
-		}
-	} else {
-		bar.update(0, {status: "downloading"});
-		const format = ytdl.chooseFormat(info.formats, {
-			quality: "highest",
-			filter: (format) => format.container === "webm",
-		});
-		const writeStream = fs.createWriteStream(filePath);
-		const videoStream = ytdl(id, {
-			quality: "highest",
-			filter: "video",
-			format,
-		});
-		videoStream.pipe(writeStream);
-		videoStream.pipe(cache.saveStream(id, etag));
-		videoStream.on("progress", (_, downloaded, total) => {
-			bar.update(downloaded / total);
-		});
-		await pEvent(videoStream, "end");
-		bar.update(100, {status: "downloading done"});
-	}
+			const filePath = path.resolve(
+				destDir,
+				`${sanitizeFilename(info.videoDetails.title)}.${format.container}`,
+			);
+			const cacheInfo = await cache.find(id, etag);
+			if (cacheInfo) {
+				bar.update(0, {status: "using cache"});
+				const cacheHash = cacheInfo.integrity;
+				const existingFileHash = await hasha.fromFile(filePath, {
+					encoding: "base64",
+					algorithm: cache.algorithm,
+				});
+				if (cacheHash === `${cache.algorithm}-${existingFileHash}`) {
+					progressBar.remove(bar);
+				} else {
+					bar.update(0, {status: "copying cache"});
+					const totalSize = cacheInfo.size;
+					let downloadedSize = 0;
+					const cacheStream = cache.getStream(id);
+					const writeStream = fs.createWriteStream(filePath);
+					cacheStream.pipe(writeStream);
+					cacheStream.on("data", (data) => {
+						downloadedSize += data.size;
+						bar.update(downloadedSize / totalSize);
+					});
+					await pEvent(cacheStream, "end");
+					progressBar.remove(bar);
+				}
+			} else {
+				bar.update(0, {status: "downloading"});
+				const writeStream = fs.createWriteStream(filePath);
+				const videoStream = ytdl(id, {
+					format,
+				});
+				videoStream.pipe(writeStream);
+				videoStream.pipe(cache.saveStream(id, etag));
+				videoStream.on("progress", (_, downloaded, total) => {
+					bar.update(downloaded / total);
+				});
+				await pEvent(videoStream, "end");
+				progressBar.remove(bar);
+			}
+		},
+		{retries: 3},
+	).catch((error) => {
+		bar.update(0, {status: `failed: ${error.message}`});
+	});
 };
 
 const bulkDownloadVideos = async (
@@ -100,9 +114,7 @@ const bulkDownloadVideos = async (
 ) => {
 	for (const video of videos) {
 		queue.add(() =>
-			downloadVideo(video.id, video.etag, destDir).catch((error) => {
-				console.error(error);
-			}),
+			pRetry(() => downloadVideo(video.id, video.etag, destDir), {retries: 5}),
 		);
 	}
 };

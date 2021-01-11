@@ -1,7 +1,7 @@
 {
 	"private": true,
 	"scripts": {
-		"start": "ts-node -T ."
+		"start": "ts-node ."
 	},
 	"prettier": "@hoishin/prettierrc",
 	"dependencies": {
