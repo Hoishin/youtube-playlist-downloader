@@ -13,7 +13,7 @@
 		"cacache": "^15.0.5",
 		"cli-progress": "^3.8.2",
 		"dotenv": "^8.2.0",
-		"google-auth-library": "^6.1.3",
+		"google-auth-library": "6.1.6",
 		"googleapis": "^66.0.0",
 		"hasha": "^5.2.2",
 		"p-event": "^4.2.0",
